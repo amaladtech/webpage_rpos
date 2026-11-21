@@ -10,6 +10,12 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 API_KEY = os.environ.get("UPLOAD_API_KEY", "change-this-secret-key")
 
 
+def get_conn():
+    if "sslmode=" in DATABASE_URL:
+        return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+
 class ScbUpload(BaseModel):
     shop_name: str
     file_name: str
@@ -18,8 +24,24 @@ class ScbUpload(BaseModel):
     payload: dict
 
 
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
+@app.on_event("startup")
+def init_db():
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS store_scb_snapshots (
+                    shop_name TEXT PRIMARY KEY,
+                    file_name TEXT NOT NULL,
+                    last_updated TEXT NOT NULL,
+                    total_visitors INTEGER NOT NULL DEFAULT 0,
+                    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @app.post("/api/upload")
@@ -27,7 +49,8 @@ def upload_scb(data: ScbUpload, x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO store_scb_snapshots (shop_name, file_name, last_updated, total_visitors, payload, synced_at)
@@ -39,22 +62,39 @@ def upload_scb(data: ScbUpload, x_api_key: str = Header(None)):
                     payload = EXCLUDED.payload,
                     synced_at = NOW();
             """, (data.shop_name, data.file_name, data.last_updated, data.total_visitors, json.dumps(data.payload)))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        conn.close()
+
     return {"status": "ok"}
 
 
 @app.get("/api/shops")
 def list_shops():
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
-            cur.execute("SELECT shop_name, file_name, last_updated, total_visitors, payload FROM store_scb_snapshots ORDER BY shop_name;")
+            cur.execute("""
+                SELECT shop_name, file_name, last_updated, total_visitors, payload
+                FROM store_scb_snapshots
+                ORDER BY shop_name;
+            """)
             rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        conn.close()
+
     return [
         {
             "shop_name": r[0],
             "file_name": r[1],
             "last_updated": r[2],
             "total_visitors": r[3],
-            "payload": r[4],
+            "payload": r[4] if isinstance(r[4], dict) else json.loads(r[4] or "{}"),
         }
         for r in rows
     ]
@@ -120,36 +160,78 @@ def dashboard():
 
   <script>
     let allShops = [];
+
     async function fetchShops() {
-      const res = await fetch("/api/shops", { cache: "no-store" });
-      allShops = await res.json();
-      const sel = document.getElementById("shopSelect");
-      const current = sel.value;
-      sel.innerHTML = allShops.map((s, i) => `<option value="${i}">${s.shop_name}</option>`).join("");
-      if (current && allShops[current]) sel.value = current;
-      renderSelected();
+      const meta = document.getElementById("metaInfo");
+      try {
+        const res = await fetch("/api/shops?t=" + Date.now(), { cache: "no-store" });
+        if (!res.ok) {
+          if (meta) meta.textContent = "API HTTP Error: " + res.status;
+          return;
+        }
+        const data = await res.json();
+        allShops = Array.isArray(data) ? data : [];
+
+        if (allShops.length === 0) {
+          if (meta) meta.textContent = "No store records in database yet.";
+          return;
+        }
+
+        const sel = document.getElementById("shopSelect");
+        const prevName = sel.options[sel.selectedIndex]?.text || "";
+        sel.innerHTML = allShops
+          .map((s, i) => `<option value="${i}">${s.shop_name ?? "My Store"}</option>`)
+          .join("");
+
+        const matchedIdx = allShops.findIndex(s => s.shop_name === prevName);
+        sel.value = matchedIdx >= 0 ? String(matchedIdx) : "0";
+        renderSelected();
+      } catch (err) {
+        if (meta) meta.textContent = "Fetch Error: " + err.message;
+      }
     }
 
     function renderSelected() {
-      const item = allShops[document.getElementById("shopSelect").value || 0];
+      const sel = document.getElementById("shopSelect");
+      const idx = parseInt(sel.value || "0", 10) || 0;
+      const item = allShops[idx];
       if (!item) return;
-      const p = item.payload || {};
-      document.getElementById("shopName").textContent = item.shop_name;
-      document.getElementById("metaInfo").textContent = `File: ${item.file_name} | Updated: ${item.last_updated}`;
-      document.getElementById("totalVisitors").textContent = item.total_visitors;
 
-      const pts = p.chart_points || [];
-      const max = Math.max(...pts.map(x => x.count), 1);
-      document.getElementById("chart").innerHTML = pts.map(x => {
-        const h = x.count > 0 ? Math.max(Math.round((x.count / max) * 100), 10) : 4;
-        return `<div class="bar-col"><div style="font-size:10px">${x.count}</div><div class="bar" style="height:${h}%"></div><div class="lbl">${x.time}</div></div>`;
-      }).join("");
+      document.getElementById("shopName").textContent = String(item.shop_name ?? "My Store");
+      document.getElementById("metaInfo").textContent =
+        `File: ${item.file_name ?? "--"} | Updated: ${item.last_updated ?? "--"} | Stores: ${allShops.length}`;
+      document.getElementById("totalVisitors").textContent = String(item.total_visitors ?? 0);
 
-      const cols = p.column_headers || [];
-      const rows = p.data_rows || [];
-      document.getElementById("thead").innerHTML = "<tr>" + cols.map(c => `<th>${c}</th>`).join("") + "</tr>";
-      document.getElementById("tbody").innerHTML = rows.map(r => "<tr>" + r.map(v => `<td>${v}</td>`).join("") + "</tr>").join("");
-      document.getElementById("rawBox").textContent = (p.all_lines || []).join("\n");
+      try {
+        const rawPayload = item.payload;
+        const p = typeof rawPayload === "string"
+          ? JSON.parse(rawPayload || "{}")
+          : (rawPayload && typeof rawPayload === "object" ? rawPayload : {});
+
+        const pts = Array.isArray(p.chart_points) ? p.chart_points : [];
+        const max = Math.max(...pts.map(x => Number(x && x.count) || 0), 1);
+        document.getElementById("chart").innerHTML = pts.map(x => {
+          const c = Number(x && x.count) || 0;
+          const h = c > 0 ? Math.max(Math.round((c / max) * 100), 10) : 4;
+          return `<div class="bar-col"><div style="font-size:10px">${c}</div><div class="bar" style="height:${h}%"></div><div class="lbl">${(x && x.time) || ""}</div></div>`;
+        }).join("");
+
+        const cols = Array.isArray(p.column_headers) ? p.column_headers : [];
+        const rows = Array.isArray(p.data_rows) ? p.data_rows : [];
+        document.getElementById("thead").innerHTML = cols.length
+          ? "<tr>" + cols.map(c => `<th>${c}</th>`).join("") + "</tr>"
+          : "";
+        document.getElementById("tbody").innerHTML = rows
+          .filter(r => Array.isArray(r))
+          .map(r => "<tr>" + r.map(v => `<td>${v}</td>`).join("") + "</tr>")
+          .join("");
+
+        document.getElementById("rawBox").textContent = Array.isArray(p.all_lines)
+          ? p.all_lines.join("\n")
+          : (p.raw_text || "--");
+      } catch (err) {
+        document.getElementById("metaInfo").textContent += " | Render note: " + err.message;
+      }
     }
 
     fetchShops();
