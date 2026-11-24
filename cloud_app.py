@@ -78,7 +78,7 @@ def list_shops():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT shop_name, file_name, last_updated, total_visitors, payload
+                SELECT shop_name, file_name, last_updated, total_visitors, payload, synced_at
                 FROM store_scb_snapshots
                 ORDER BY shop_name;
             """)
@@ -95,6 +95,7 @@ def list_shops():
             "last_updated": r[2],
             "total_visitors": r[3],
             "payload": r[4] if isinstance(r[4], dict) else json.loads(r[4] or "{}"),
+            "synced_at": r[5].isoformat() if r[5] else None,
         }
         for r in rows
     ]
@@ -102,7 +103,7 @@ def list_shops():
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-    return """<!doctype html>
+    return r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -298,6 +299,13 @@ def dashboard():
         document.getElementById("shopName").textContent = "No store records yet";
         document.getElementById("metaInfo").textContent = "Waiting for the first SCB upload.";
         document.getElementById("totalVisitors").textContent = "0";
+        document.getElementById("lastSync").textContent = "--";
+        document.getElementById("fileName").textContent = "--";
+        document.getElementById("thead").innerHTML = "";
+        document.getElementById("tbody").innerHTML = '<tr><td class="muted">No counter data available.</td></tr>';
+        document.getElementById("rowCount").textContent = "0 rows";
+        document.getElementById("rawBox").textContent = "No raw SCB data available.";
+        selectedItem = null;
         document.getElementById("chart").innerHTML = '<div class="empty">No visitor data received yet.</div>';
         return;
       }
@@ -331,10 +339,15 @@ def dashboard():
       const height = count > 0 ? Math.max(7, count / max * 100) : 3;
       return `<div class="bar-col"><span class="bar-value">${count}</span><div class="bar" style="height:${height}%"></div><span class="bar-label">${escapeHtml(point.time || point.label || "")}</span></div>`;
     }).join("") : '<div class="empty">No chart points included in this SCB upload.</div>';
-    const cols = Array.isArray(p.column_headers) ? p.column_headers : [];
-    const rows = Array.isArray(p.data_rows) ? p.data_rows : [];
+    const rows = Array.isArray(p.data_rows) ? p.data_rows.filter(Array.isArray) : [];
+    let cols = Array.isArray(p.column_headers) ? p.column_headers : [];
+    // If the uploader did not send headings, create neutral headings from row width.
+    if (!cols.length && rows.length) {
+      const width = Math.max(...rows.map(row => row.length));
+      cols = Array.from({length: width}, (_, i) => "Column " + (i + 1));
+    }
     document.getElementById("thead").innerHTML = cols.length ? "<tr>" + cols.map(c => `<th>${escapeHtml(c)}</th>`).join("") + "</tr>" : "";
-    document.getElementById("tbody").innerHTML = rows.length ? rows.filter(Array.isArray).map(row => "<tr>" + row.map(v => `<td>${escapeHtml(v)}</td>`).join("") + "</tr>").join("") : '<tr><td class="muted">No counter rows included in this upload.</td></tr>';
+    document.getElementById("tbody").innerHTML = rows.length ? rows.map(row => "<tr>" + row.map(v => `<td>${escapeHtml(v)}</td>`).join("") + "</tr>").join("") : '<tr><td class="muted">No counter rows included in this upload.</td></tr>';
     document.getElementById("rowCount").textContent = rows.length + " rows";
     document.getElementById("rawBox").textContent = Array.isArray(p.all_lines) ? p.all_lines.join("\n") : (typeof p.raw_text === "string" ? p.raw_text : "No raw SCB text included.");
   }
@@ -344,8 +357,12 @@ def dashboard():
     if (!selectedItem) return;
     let p = selectedItem.payload;
     try { if (typeof p === "string") p = JSON.parse(p || "{}"); } catch(e) { p = {}; }
-    const rows = Array.isArray(p.data_rows) ? p.data_rows : [];
-    const headers = Array.isArray(p.column_headers) ? [p.column_headers] : [];
+    const rows = Array.isArray(p.data_rows) ? p.data_rows.filter(Array.isArray) : [];
+    let headers = Array.isArray(p.column_headers) && p.column_headers.length ? [p.column_headers] : [];
+    if (!headers.length && rows.length) {
+      const width = Math.max(...rows.map(row => row.length));
+      headers = [Array.from({length: width}, (_, i) => "Column " + (i + 1))];
+    }
     const csv = [...headers, ...rows].map(row => (Array.isArray(row) ? row : []).map(v => '"' + String(v ?? "").replace(/"/g,'""') + '"').join(",")).join("\r\n");
     const blob = new Blob(["\ufeff" + csv], {type:"text/csv;charset=utf-8"});
     const url = URL.createObjectURL(blob);
